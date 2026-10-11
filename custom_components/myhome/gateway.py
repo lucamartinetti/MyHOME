@@ -114,7 +114,11 @@ class MyHOMEGatewayHandler:
 
     @property
     def manufacturer(self) -> str:
-        return self.gateway.manufacturer
+        # SSDP discovery can store the manufacturer as a list; the device registry wants a string (2026.12+).
+        manufacturer = self.gateway.manufacturer
+        if isinstance(manufacturer, (list, tuple)):
+            return ", ".join(str(m) for m in manufacturer)
+        return manufacturer
 
     @property
     def name(self) -> str:
@@ -126,7 +130,11 @@ class MyHOMEGatewayHandler:
 
     @property
     def firmware(self) -> str:
-        return self.gateway.firmware
+        # Same as manufacturer: may arrive as a list; the device registry wants a string (2026.12+).
+        firmware = self.gateway.firmware
+        if isinstance(firmware, (list, tuple)):
+            return ", ".join(str(f) for f in firmware)
+        return firmware
 
     async def test(self) -> Dict:
         return await OWNSession(gateway=self.gateway, logger=LOGGER).test_connection()
