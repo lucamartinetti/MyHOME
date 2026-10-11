@@ -1,5 +1,7 @@
 """Support for MyHome heating."""
 
+import asyncio
+
 from homeassistant.components.climate import (
     ClimateEntity,
     DOMAIN as PLATFORM,
@@ -193,6 +195,9 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
 
         self._zone = str(self._where).split("#")[-1]
         self._resume_setpoint = None
+        # patches/myhome/0003: zone demand from the central's 4001/4002 frames (None = not seen yet).
+        self._demand = None
+        self._echo_seen = True
 
     _plant_season = None  # shared: one thermoregulation plant
 
@@ -208,12 +213,26 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
             modes.append(HVACMode.HEAT)
         return modes
 
-    async def _send_frame(self, frame):
+    async def _send_frame(self, frame, retries=2):
         message = OWNCommand.parse(frame)
         if message is None or not message.is_valid:
             LOGGER.error("%s Invalid thermoregulation frame `%s`, not sent.", self._gateway_handler.log_id, frame)
             return
+        # `*#4*Z*#7*S*M*TTTT##`: M 1 = manual setpoint (on), 2 = protection (off)
+        self._expect_off = frame.split("*")[5] == "2"
+        self._echo_seen = False
         await self._gateway_handler.send(message)
+        if retries:
+            # patches/myhome/0003: the .46 central sometimes drops a zone write (seen 2026-10-05: the first command after a
+            # reload, and a command sent during the post-start zone re-query burst). An accepted write is echoed within
+            # ~1 s by the zone's mode frame in the requested state (off / on); without it in 8 s, send it again.
+            self.hass.async_create_task(self._retry_if_no_echo(frame, retries))
+
+    async def _retry_if_no_echo(self, frame, retries):
+        await asyncio.sleep(8)
+        if not self._echo_seen:
+            LOGGER.warning("%s Zone %s did not echo `%s`; sending it again.", self._gateway_handler.log_id, self._zone, frame)
+            await self._send_frame(frame, retries=retries - 1)
 
     async def _send_setpoint(self, temperature):
         season = self._season()
@@ -262,8 +281,32 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
             return
         await self._send_setpoint(temperature)
 
+    def _active_action(self):
+        if self._season() == SEASON_COOL and self._cooling:
+            return HVACAction.COOLING
+        if self._season() == SEASON_HEAT and self._heating:
+            return HVACAction.HEATING
+        return HVACAction.COOLING if self._cooling and not self._heating else HVACAction.HEATING
+
+    def _apply_demand(self):
+        if self._attr_hvac_mode == HVACMode.OFF:
+            self._attr_hvac_action = HVACAction.OFF
+        elif self._demand:
+            self._attr_hvac_action = self._active_action()
+        elif self._demand is False:
+            self._attr_hvac_action = HVACAction.IDLE
+
+    def handle_demand(self, on: bool):
+        """Zone demand from the central (patches/myhome/0003): 4001 = calling, 4002 = satisfied."""
+        self._demand = on
+        self._apply_demand()
+        self.async_schedule_update_ha_state()
+
     def handle_event(self, message: OWNHeatingEvent):
         """Handle an event message."""
+        if message.message_type in (MESSAGE_TYPE_MODE, MESSAGE_TYPE_MODE_TARGET) and message.mode is not None:
+            if (message.mode == CLIMATE_MODE_OFF) == getattr(self, "_expect_off", None):
+                self._echo_seen = True
         if self._heating and self._cooling and message.message_type in (MESSAGE_TYPE_MODE, MESSAGE_TYPE_MODE_TARGET):
             code = str(getattr(message, "_mode", ""))
             if code == "0" or (len(code) >= 3 and code[0] == "2"):
@@ -415,12 +458,18 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
                 self._gateway_handler.log_id,
                 message.human_readable_log,
             )
-            if message.is_active():
+            if self._demand is not None:
+                # patches/myhome/0003: the central's demand frames are authoritative; a zone has several
+                # actuators (valve, fan coil) whose individual states would make hvac_action flap.
+                self._apply_demand()
+            elif message.is_active():
                 if self._heating and self._cooling:
                     if message.is_heating():
                         self._attr_hvac_action = HVACAction.HEATING
                     elif message.is_cooling():
                         self._attr_hvac_action = HVACAction.COOLING
+                    else:  # patches/myhome/0003: dimension 20 has no season flag; use the plant season
+                        self._attr_hvac_action = self._active_action()
                 elif self._heating:
                     self._attr_hvac_action = HVACAction.HEATING
                 elif self._cooling:
@@ -429,6 +478,9 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
                 self._attr_hvac_action = HVACAction.OFF
             else:
                 self._attr_hvac_action = HVACAction.IDLE
+
+        if message.message_type in (MESSAGE_TYPE_MODE, MESSAGE_TYPE_MODE_TARGET) and self._demand is not None:
+            self._apply_demand()
 
         target = self.target_temperature
         if self._attr_hvac_mode in (HVACMode.COOL, HVACMode.HEAT) and target is not None and 10 <= target <= 32:

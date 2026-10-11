@@ -1,5 +1,6 @@
 """Code to handle a MyHome Gateway."""
 import asyncio
+import re
 from typing import Dict, List
 
 from homeassistant.const import (
@@ -130,6 +131,46 @@ class MyHOMEGatewayHandler:
     async def test(self) -> Dict:
         return await OWNSession(gateway=self.gateway, logger=LOGGER).test_connection()
 
+    # Local patch (homeassistant-setup patches/myhome/0003): thermoregulation central frames.
+    #   `*#4*0#N*20*V##`        state of central output ("pump") N, V 0 = off
+    #   `*4*4001#Z*0#N##`       zone Z requests output N (4002 = releases it)
+    #   `*4*4001*Z##`           zone Z demand on (4002 = off)
+    # Stock OWNd parses these as zone N / zone Z frames (output 6 lands on zone 6's climate entity), so they are
+    # handled here and NOT dispatched to entities. They are fired as HA events (`myhome_thermo_output`,
+    # `myhome_thermo_request`) and the zone demand is passed to that zone's climate entity (hvac_action).
+    _RE_THERMO_OUTPUT = re.compile(r"^\*#4\*0#(\d+)\*20\*(\d+)##$")
+    _RE_THERMO_REQUEST = re.compile(r"^\*4\*(4001|4002)#(\d+)\*0#(\d+)##$")
+    _RE_THERMO_DEMAND = re.compile(r"^\*4\*(4001|4002)\*(\d+)##$")
+
+    def _handle_thermo_central(self, frame: str) -> bool:
+        if m := self._RE_THERMO_OUTPUT.match(frame):
+            self.hass.bus.async_fire(
+                "myhome_thermo_output",
+                {"gateway": str(self.gateway.host), "output": int(m[1]), "on": m[2] != "0", "value": int(m[2])},
+            )
+            return True
+        if m := self._RE_THERMO_REQUEST.match(frame):
+            zone, output, on = int(m[2]), int(m[3]), m[1] == "4001"
+            self.hass.bus.async_fire(
+                "myhome_thermo_request",
+                {"gateway": str(self.gateway.host), "zone": zone, "output": output, "on": on},
+            )
+            self._thermo_zone_demand(zone, on)
+            return True
+        if m := self._RE_THERMO_DEMAND.match(frame):
+            self._thermo_zone_demand(int(m[2]), m[1] == "4001")
+            return True
+        return False
+
+    def _thermo_zone_demand(self, zone: int, on: bool):
+        climates = self.hass.data[DOMAIN][self.mac][CONF_PLATFORMS].get(CLIMATE, {})
+        device = climates.get(f"4-{zone}")
+        if device is None:
+            return
+        for _entity in device[CONF_ENTITIES].values():
+            if hasattr(_entity, "handle_demand"):
+                _entity.handle_demand(on)
+
     async def listening_loop(self):
         self._terminate_listener = False
 
@@ -157,6 +198,8 @@ class MyHOMEGatewayHandler:
                     self.log_id,
                     message,
                 )
+            elif self._handle_thermo_central(str(message)):
+                pass
             elif isinstance(message, OWNEnergyEvent):
                 if SENSOR in self.hass.data[DOMAIN][self.mac][CONF_PLATFORMS] and message.entity in self.hass.data[DOMAIN][self.mac][CONF_PLATFORMS][SENSOR]:
                     for _entity in self.hass.data[DOMAIN][self.mac][CONF_PLATFORMS][SENSOR][message.entity][CONF_ENTITIES]:

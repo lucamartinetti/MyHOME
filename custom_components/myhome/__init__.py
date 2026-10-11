@@ -254,7 +254,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                             hass.data[DOMAIN][gateway][CONF_ENTITY].log_id,
                             own_message,
                         )
-                        await hass.data[DOMAIN][gateway][CONF_ENTITY].send(own_message)
+                        if str(message).startswith("*#"):
+                            # patches/myhome/0003: status requests go through the status path (the gateway answers
+                            # with data before the ACK); the answers arrive as events.
+                            await hass.data[DOMAIN][gateway][CONF_ENTITY].send_status_request(own_message)
+                        else:
+                            await hass.data[DOMAIN][gateway][CONF_ENTITY].send(own_message)
                 else:
                     LOGGER.error(
                         "Could not parse message `%s`, not sending it.", message
