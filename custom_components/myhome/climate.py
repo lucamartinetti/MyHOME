@@ -74,9 +74,23 @@ DEFAULT_RESUME = {SEASON_COOL: 26.0, SEASON_HEAT: 20.0}
 PROTECTION = {SEASON_COOL: "0350", SEASON_HEAT: "0070"}
 
 
+def _load_netatmo_map(path):
+    """patches/myhome/0004: zone -> Netatmo (BTicino Home + Control cloud) climate entity, from /config/myhome_netatmo.yaml."""
+    import os
+    import yaml
+
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return {str(k): str(v) for k, v in (data.get("zones") or {}).items()}
+
+
 async def async_setup_entry(hass, config_entry, async_add_entities):
     if PLATFORM not in hass.data[DOMAIN][config_entry.data[CONF_MAC]][CONF_PLATFORMS]:
         return True
+
+    netatmo_map = await hass.async_add_executor_job(_load_netatmo_map, hass.config.path("myhome_netatmo.yaml"))
 
     _climate_devices = []
     _configured_climate_devices = hass.data[DOMAIN][config_entry.data[CONF_MAC]][
@@ -107,6 +121,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
                 ],
                 model=_configured_climate_devices[_climate_device][CONF_DEVICE_MODEL],
                 gateway=hass.data[DOMAIN][config_entry.data[CONF_MAC]][CONF_ENTITY],
+                netatmo_entity=netatmo_map.get(str(_configured_climate_devices[_climate_device][CONF_ZONE]).split("#")[-1]),
             )
         )
 
@@ -143,6 +158,7 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
         manufacturer: str,
         model: str,
         gateway: MyHOMEGatewayHandler,
+        netatmo_entity: str | None = None,
     ):
         super().__init__(
             hass=hass,
@@ -198,6 +214,9 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
         # patches/myhome/0003: zone demand from the central's 4001/4002 frames (None = not seen yet).
         self._demand = None
         self._echo_seen = True
+        # patches/myhome/0004: commands go through the BTicino Home + Control cloud (Netatmo integration) when a
+        # Netatmo room entity is mapped, so the app, the cloud and HA stay consistent; local writes are the fallback.
+        self._netatmo_entity = netatmo_entity
 
     _plant_season = None  # shared: one thermoregulation plant
 
@@ -257,6 +276,27 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
         else:
             return self._target_temperature
 
+    @property
+    def extra_state_attributes(self):
+        return {"netatmo_entity": self._netatmo_entity} if self._netatmo_entity else None
+
+    async def _via_netatmo(self, service, **data) -> bool:
+        """patches/myhome/0004: run climate.<service> on the mapped Netatmo room. False = not mapped / failed (use local)."""
+        entity = self._netatmo_entity
+        if not entity:
+            return False
+        state = self.hass.states.get(entity)
+        if state is None or state.state in ("unavailable", "unknown"):
+            LOGGER.warning("%s Zone %s: %s is %s; using the local command.", self._gateway_handler.log_id, self._zone, entity, state and state.state)
+            return False
+        try:
+            await self.hass.services.async_call("climate", service, {"entity_id": entity, **data}, blocking=True)
+        except Exception as err:  # noqa: BLE001 - any cloud failure falls back to the local write
+            LOGGER.warning("%s Zone %s: Netatmo %s failed (%s); using the local command.", self._gateway_handler.log_id, self._zone, service, err)
+            return False
+        LOGGER.info("%s Zone %s: %s %s via Netatmo (%s).", self._gateway_handler.log_id, self._zone, service, data or "", entity)
+        return True
+
     async def async_set_hvac_mode(self, hvac_mode):
         """Set new target hvac mode (dimension-7 zone writes, see the patch note above)."""
         season = self._season()
@@ -264,8 +304,13 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
             LOGGER.warning("%s Season unknown yet; not changing zone %s.", self._gateway_handler.log_id, self._zone)
             return
         if hvac_mode == HVACMode.OFF:
+            # Netatmo: room off. On: room back to its schedule (the schedule's temperature, as in the app).
+            if await self._via_netatmo("turn_off"):
+                return
             await self._send_frame(f"*#4*{self._zone}*#7*{season}*2*{PROTECTION[season]}##")
         elif hvac_mode in self.hvac_modes:
+            if await self._via_netatmo("turn_on"):
+                return
             await self._send_setpoint(self._resume_setpoint or DEFAULT_RESUME[season])
         else:
             LOGGER.warning("%s Zone %s: %s is not available in this season.", self._gateway_handler.log_id, self._zone, hvac_mode)
@@ -278,6 +323,9 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
         hvac_mode = kwargs.get("hvac_mode", self._attr_hvac_mode)
         if hvac_mode == HVACMode.OFF or self._season() is None:
             self._resume_setpoint = temperature
+            return
+        # Netatmo manual setpoint: like the app, it lasts the home's default manual duration, then the schedule resumes.
+        if await self._via_netatmo("set_temperature", temperature=min(max(round(temperature * 2) / 2, 7.0), 30.0)):
             return
         await self._send_setpoint(temperature)
 
