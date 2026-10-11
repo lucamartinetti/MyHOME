@@ -161,6 +161,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         for _device in hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_PLATFORMS][
             _platform
         ].keys():
+            # A configured device keeps its base unique_id even if its entity never loaded: CONF_ENTITIES is only
+            # filled when an entity is added to hass, so a user-disabled entity (e.g. restored from the registry's
+            # deleted_entities as disabled) was pruned here on every setup and could never be re-enabled.
+            configured_entities.append(f"{entry.data[CONF_MAC]}-{_device}")
             for _entity_name in hass.data[DOMAIN][entry.data[CONF_MAC]][CONF_PLATFORMS][
                 _platform
             ][_device][CONF_ENTITIES]:
