@@ -33,6 +33,7 @@ from .const import (
     CONF_MANUFACTURER,
     CONF_DEVICE_MODEL,
     CONF_DIMMABLE,
+    CONF_COMMAND_SPEED,
     DOMAIN,
     LOGGER,
 )
@@ -59,6 +60,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
             name=_configured_lights[_light][CONF_NAME],
             entity_name=_configured_lights[_light][CONF_ENTITY_NAME],
             dimmable=_configured_lights[_light][CONF_DIMMABLE],
+            command_speed=_configured_lights[_light].get(CONF_COMMAND_SPEED),
             manufacturer=_configured_lights[_light][CONF_MANUFACTURER],
             model=_configured_lights[_light][CONF_DEVICE_MODEL],
             gateway=hass.data[DOMAIN][config_entry.data[CONF_MAC]][CONF_ENTITY],
@@ -102,6 +104,7 @@ class MyHOMELight(MyHOMEEntity, LightEntity):
         manufacturer: str,
         model: str,
         gateway: MyHOMEGatewayHandler,
+        command_speed: int | None = None,
     ):
         super().__init__(
             hass=hass,
@@ -118,6 +121,7 @@ class MyHOMELight(MyHOMEEntity, LightEntity):
         self._attr_name = entity_name
 
         self._interface = interface
+        self._command_speed = command_speed
         self._full_where = f"{self._where}#4#{self._interface}" if self._interface is not None else self._where
 
         self._attr_supported_features = 0
@@ -161,6 +165,8 @@ class MyHOMELight(MyHOMEEntity, LightEntity):
 
     async def async_turn_on(self, **kwargs):
         """Turn the device on."""
+        if self._command_speed is not None and ATTR_TRANSITION not in kwargs:
+            kwargs[ATTR_TRANSITION] = self._command_speed
 
         if ATTR_FLASH in kwargs and self._attr_supported_features & LightEntityFeature.FLASH:
             if kwargs[ATTR_FLASH] == FLASH_SHORT:
@@ -198,6 +204,8 @@ class MyHOMELight(MyHOMEEntity, LightEntity):
 
     async def async_turn_off(self, **kwargs):
         """Turn the device off."""
+        if self._command_speed is not None and ATTR_TRANSITION not in kwargs:
+            kwargs[ATTR_TRANSITION] = self._command_speed
 
         if ATTR_TRANSITION in kwargs and self._attr_supported_features & LightEntityFeature.TRANSITION:
             return await self._gateway_handler.send(OWNLightingCommand.switch_off(self._full_where, int(kwargs[ATTR_TRANSITION])))

@@ -10,6 +10,7 @@ from voluptuous import (
     Any,
     All,
     In,
+    Range,
     Invalid,
 )
 from homeassistant.helpers.device_registry import format_mac as ha_format_mac
@@ -46,6 +47,7 @@ from .const import (
     CONF_DEVICE_MODEL,
     CONF_DEVICE_CLASS,
     CONF_DIMMABLE,
+    CONF_COMMAND_SPEED,
     CONF_ADVANCED_SHUTTER,
     CONF_INVERTED,
     CONF_HEATING_SUPPORT,
@@ -295,6 +297,7 @@ light_schema = MyHomeDeviceSchema(
             Optional(CONF_ICON): str,
             Optional(CONF_ICON_ON): str,
             Optional(CONF_DIMMABLE, default=False): Boolean(),
+            Optional(CONF_COMMAND_SPEED): All(Coerce(int), Range(min=0, max=255)),
             Optional(CONF_MANUFACTURER, default="BTicino S.p.A."): str,
             Optional(CONF_DEVICE_MODEL): Coerce(str),
         }

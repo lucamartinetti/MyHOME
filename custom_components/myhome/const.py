@@ -33,6 +33,9 @@ CONF_WHERE = "where"
 CONF_BUS_INTERFACE = "interface"
 CONF_ZONE = "zone"
 CONF_DIMMABLE = "dimmable"
+# Speed/transition every command to this light carries (#<speed>): some newer dimmer channels ignore plain
+# *1*0*W## / *1*1*W## and only accept the BTicino app's form *1*0#255*W##, *#1*W*#1*<level>*255## (bedside 32/44).
+CONF_COMMAND_SPEED = "command_speed"
 CONF_GATEWAY = "gateway"
 CONF_DEVICE_CLASS = "class"
 CONF_INVERTED = "inverted"
