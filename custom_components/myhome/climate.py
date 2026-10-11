@@ -21,6 +21,7 @@ from homeassistant.const import (
 )
 
 from OWNd.message import (
+    OWNCommand,
     OWNHeatingEvent,
     OWNHeatingCommand,
     CLIMATE_MODE_OFF,
@@ -54,6 +55,21 @@ from .const import (
 )
 from .myhome_device import MyHOMEEntity
 from .gateway import MyHOMEGatewayHandler
+
+# Local patch (homeassistant-setup patches/myhome/0001): MyHOMEServer1 software central.
+# On this plant the thermoregulation central is a MyHOMEServer1 (the climate block is
+# configured under that gateway). It only acts on the zone writes the BTicino app sends,
+# dimension 7: `*#4*Z*#7*<season>*1*<TTTT>##` (manual setpoint) and `*#4*Z*#7*<season>*2*<TTTT>##`
+# (off = protection at 35.0 cooling / 7.0 heating; without the temperature it is ignored),
+# season 2 = cooling, 1 = heating. The stock dimension-14 and
+# `*4*303*#Z##` commands are ignored (verified on the bus 2026-10-03). No weekly program
+# is used, so AUTO is not offered. The season follows the zones that can heat AND cool
+# (they report 0/2xx in summer, 1/1xx in winter); single-season zones offer only OFF
+# outside their season.
+SEASON_COOL = "2"
+SEASON_HEAT = "1"
+DEFAULT_RESUME = {SEASON_COOL: 26.0, SEASON_HEAT: 20.0}
+PROTECTION = {SEASON_COOL: "0350", SEASON_HEAT: "0070"}
 
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
@@ -153,8 +169,6 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
         self._cooling = cooling
         if heating or cooling:
             self._attr_supported_features |= ClimateEntityFeature.TARGET_TEMPERATURE
-            if not self._central:
-                self._attr_hvac_modes.append(HVACMode.AUTO)
             if heating:
                 self._attr_hvac_modes.append(HVACMode.HEAT)
             if cooling:
@@ -177,6 +191,35 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
 
         self._attr_fan_mode = None
 
+        self._zone = str(self._where).split("#")[-1]
+        self._resume_setpoint = None
+
+    _plant_season = None  # shared: one thermoregulation plant
+
+    def _season(self):
+        return MyHOMEClimate._plant_season
+
+    @property
+    def hvac_modes(self):
+        modes = [HVACMode.OFF]
+        if self._season() == SEASON_COOL and self._cooling:
+            modes.append(HVACMode.COOL)
+        elif self._season() == SEASON_HEAT and self._heating:
+            modes.append(HVACMode.HEAT)
+        return modes
+
+    async def _send_frame(self, frame):
+        message = OWNCommand.parse(frame)
+        if message is None or not message.is_valid:
+            LOGGER.error("%s Invalid thermoregulation frame `%s`, not sent.", self._gateway_handler.log_id, frame)
+            return
+        await self._gateway_handler.send(message)
+
+    async def _send_setpoint(self, temperature):
+        season = self._season()
+        temperature = min(max(round(temperature * 2) / 2, 5.0), 40.0)
+        await self._send_frame(f"*#4*{self._zone}*#7*{season}*1*{int(round(temperature * 10)):04d}##")
+
     async def async_update(self):
         """Update the entity.
 
@@ -188,90 +231,45 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
 
     @property
     def target_temperature(self) -> float:
+        if self._attr_hvac_mode == HVACMode.OFF:
+            return None
         if self._local_target_temperature is not None:
             return self._local_target_temperature
         else:
             return self._target_temperature
 
     async def async_set_hvac_mode(self, hvac_mode):
-        """Set new target hvac mode."""
+        """Set new target hvac mode (dimension-7 zone writes, see the patch note above)."""
+        season = self._season()
+        if season is None:
+            LOGGER.warning("%s Season unknown yet; not changing zone %s.", self._gateway_handler.log_id, self._zone)
+            return
         if hvac_mode == HVACMode.OFF:
-            await self._gateway_handler.send(
-                OWNHeatingCommand.set_mode(
-                    where=self._where,
-                    mode=CLIMATE_MODE_OFF,
-                    standalone=self._standalone,
-                )
-            )
-        elif hvac_mode == HVACMode.AUTO:
-            await self._gateway_handler.send(
-                OWNHeatingCommand.set_mode(
-                    where=self._where,
-                    mode=CLIMATE_MODE_AUTO,
-                    standalone=self._standalone,
-                )
-            )
-        elif hvac_mode == HVACMode.HEAT:
-            if self._target_temperature is not None:
-                await self._gateway_handler.send(
-                    OWNHeatingCommand.set_temperature(
-                        where=self._where,
-                        temperature=self._target_temperature,
-                        mode=CLIMATE_MODE_HEAT,
-                        standalone=self._standalone,
-                    )
-                )
-        elif hvac_mode == HVACMode.COOL:
-            if self._target_temperature is not None:
-                await self._gateway_handler.send(
-                    OWNHeatingCommand.set_temperature(
-                        where=self._where,
-                        temperature=self._target_temperature,
-                        mode=CLIMATE_MODE_COOL,
-                        standalone=self._standalone,
-                    )
-                )
-
-    # async def async_set_fan_mode(self, fan_mode):
-    #     """Set new target fan mode."""
-    #     pass
+            await self._send_frame(f"*#4*{self._zone}*#7*{season}*2*{PROTECTION[season]}##")
+        elif hvac_mode in self.hvac_modes:
+            await self._send_setpoint(self._resume_setpoint or DEFAULT_RESUME[season])
+        else:
+            LOGGER.warning("%s Zone %s: %s is not available in this season.", self._gateway_handler.log_id, self._zone, hvac_mode)
 
     async def async_set_temperature(self, **kwargs):
-        """Set new target temperature."""
-        target_temperature = (
-            kwargs.get("temperature", self._local_target_temperature)
-            - self._local_offset
-        )
-        if self._attr_hvac_mode == HVACMode.HEAT:
-            await self._gateway_handler.send(
-                OWNHeatingCommand.set_temperature(
-                    where=self._where,
-                    temperature=target_temperature,
-                    mode=CLIMATE_MODE_HEAT,
-                    standalone=self._standalone,
-                )
-            )
-        elif self._attr_hvac_mode == HVACMode.COOL:
-            await self._gateway_handler.send(
-                OWNHeatingCommand.set_temperature(
-                    where=self._where,
-                    temperature=target_temperature,
-                    mode=CLIMATE_MODE_COOL,
-                    standalone=self._standalone,
-                )
-            )
-        else:
-            await self._gateway_handler.send(
-                OWNHeatingCommand.set_temperature(
-                    where=self._where,
-                    temperature=target_temperature,
-                    mode=CLIMATE_MODE_AUTO,
-                    standalone=self._standalone,
-                )
-            )
+        """Set new target temperature. While the zone is off it is only remembered for the next turn-on."""
+        if (temperature := kwargs.get("temperature")) is None:
+            return
+        temperature -= self._local_offset
+        hvac_mode = kwargs.get("hvac_mode", self._attr_hvac_mode)
+        if hvac_mode == HVACMode.OFF or self._season() is None:
+            self._resume_setpoint = temperature
+            return
+        await self._send_setpoint(temperature)
 
     def handle_event(self, message: OWNHeatingEvent):
         """Handle an event message."""
+        if self._heating and self._cooling and message.message_type in (MESSAGE_TYPE_MODE, MESSAGE_TYPE_MODE_TARGET):
+            code = str(getattr(message, "_mode", ""))
+            if code == "0" or (len(code) >= 3 and code[0] == "2"):
+                MyHOMEClimate._plant_season = SEASON_COOL
+            elif code == "1" or (len(code) >= 3 and code[0] == "1"):
+                MyHOMEClimate._plant_season = SEASON_HEAT
         if message.message_type == MESSAGE_TYPE_MAIN_TEMPERATURE:
             LOGGER.info(
                 "%s %s",
@@ -431,5 +429,9 @@ class MyHOMEClimate(MyHOMEEntity, ClimateEntity):
                 self._attr_hvac_action = HVACAction.OFF
             else:
                 self._attr_hvac_action = HVACAction.IDLE
+
+        target = self.target_temperature
+        if self._attr_hvac_mode in (HVACMode.COOL, HVACMode.HEAT) and target is not None and 10 <= target <= 32:
+            self._resume_setpoint = target
 
         self.async_schedule_update_ha_state()
